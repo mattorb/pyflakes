@@ -1,0 +1,160 @@
+#!/usr/bin/python
+
+import compiler, sys
+import os
+from pyflakes import checker, messages
+import optparse
+import fnmatch
+import linecache
+
+
+class MessageFilters(object):
+
+    def __init__(self, filters=()):
+        self.filters = list(filters)
+
+    def add(self, class_name, arg, filename_pattern):
+        self.filters.append((class_name, arg, filename_pattern))
+
+    def show(self, message, filename):
+        for class_name, arg, filename_pattern in self.filters:
+            if filename_pattern:
+                if not fnmatch.fnmatch(filename, filename_pattern):
+                    continue # this filter does not apply
+            if message.__class__.__name__ == class_name or class_name == '*':
+                if not arg or arg == '*':
+                    return False
+                if (arg, ) == message.message_args[:1]:
+                    return False
+        return True
+
+
+class UnusedImportFilter(object):
+    """Suppress UnusedImport warnings if the import line has a comment."""
+
+    def show(self, message, filename):
+        if isinstance(message, messages.UnusedImport):
+            source_line = linecache.getline(filename, message.lineno)
+            if '#' in source_line:
+                return False
+        return True
+
+
+class CombinedFilter(object):
+
+    def __init__(self, filters=()):
+        self.filters = list(filters)
+
+    def add(self, filter):
+        self.filters.append(filter)
+
+    def show(self, message, filename):
+        for filter in self.filters:
+            if not filter.show(message, filename):
+                return False
+        return True
+
+
+class FilenameFilters(object):
+
+    def __init__(self, patterns):
+        self.patterns = patterns
+
+    def allows(self, filename):
+        for pattern in self.patterns:
+            if fnmatch.fnmatch(filename, pattern):
+                return False
+        return True
+
+
+def check(codeString, filename, filters):
+    try:
+        tree = compiler.parse(codeString)
+    except (SyntaxError, IndentationError), e:
+        msg = e.args[0]
+        value = sys.exc_info()[1]
+        try:
+            (lineno, offset, text) = value[1][1:]
+        except IndexError:
+            print >> sys.stderr, 'could not compile %r' % (filename,)
+            return 1
+        line = text.splitlines()[-1]
+        offset = offset - (len(text) - len(line))
+
+        print >> sys.stderr, '%s:%d: %s' % (filename, lineno, msg)
+        print >> sys.stderr, line
+        print >> sys.stderr, " " * (offset-1) + "^"
+        return 1
+    else:
+        try:
+            w = checker.Checker(tree, filename)
+        except:
+            print >> sys.stderr, "in %s:" % filename
+            raise
+        w.messages.sort(lambda a, b: cmp(a.lineno, b.lineno))
+        for warning in w.messages:
+            if not filters.show(warning, filename):
+                w.messages.remove(warning) # it doesn't affect return code
+            else:
+                print warning
+        return len(w.messages)
+
+
+def checkPath(filename, filters):
+    if os.path.exists(filename):
+        return check(file(filename, 'U').read(), filename, filters=filters)
+    print >> sys.stderr, '%s: not found' % filename
+    return 0
+
+
+parser = optparse.OptionParser()
+parser.add_option('-x', '--exclude', metavar='FILENAME_PATTERN',
+                  help='skip files matching this pattern (* matches /)',
+                  action='append', type='str', dest='exclude', default=[])
+parser.add_option('-i', '--ignore', metavar='WARNING_CLASS[:NAME[:FILENAME_PATTERN]][,...]',
+                  help='ignore warnings of a given class, or just names about a given name',
+                  action='append', type='str', dest='ignore', default=[])
+opts, args = parser.parse_args()
+
+
+exclude = FilenameFilters(opts.exclude)
+
+filters = MessageFilters()
+for arg in opts.ignore:
+    if arg == 'help':
+        print "Warning classes:"
+        for name in sorted(dir(messages)):
+            obj = getattr(messages, name)
+            if isinstance(obj, type) and issubclass(obj, messages.Message) and obj is not messages.Message:
+                print ' ', obj.__name__.ljust(24), ' ', obj.message.replace('%r', 'X').replace('%s', 'X')
+        sys.exit(0)
+    for spec in arg.split(','):
+        bits = spec.split(':') + [None, None]
+        class_name, arg, filename_pattern = bits[:3]
+        filters.add(class_name, arg, filename_pattern)
+
+filters = CombinedFilter([filters, UnusedImportFilter()])
+
+warnings = 0
+if args:
+    for arg in args:
+        if os.path.isdir(arg):
+            for dirpath, dirnames, filenames in os.walk(arg):
+                dirnames.sort()
+                for filename in sorted(filenames):
+                    if filename.endswith('.py'):
+                        filepath = os.path.join(dirpath, filename)
+                        if exclude.allows(filepath):
+                            thisWarningCount = checkPath(filepath,
+                                                  filters=filters)
+                            warnings += thisWarningCount
+        else:
+            if exclude.allows(arg):
+                thisWarningCount = checkPath(filepath,
+                                      filters=filters)
+                warnings += thisWarningCount
+                
+else:
+    warnings += check(sys.stdin.read(), '<stdin>', filters=filters)
+
+raise SystemExit(warnings > 0)
